@@ -1,15 +1,23 @@
 """
 Retry logic with exponential backoff for the REST client library.
 
-This module provides retry mechanisms for handling transient failures.
+This module provides retry mechanisms for handling transient failures using Tenacity.
 """
 
-import time
-import random
 import asyncio
 from typing import Callable, Set, Optional, Union
 import httpx
 import logging
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    retry_if_result,
+    stop_after_attempt,
+    wait_exponential,
+    wait_fixed,
+    before_sleep_log,
+    RetryCallState,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +97,7 @@ class RetryConfig:
             return min(float(retry_after), self.max_backoff)
 
         # Calculate exponential backoff: backoff_factor * (2 ** attempt)
+        import random
         backoff = self.backoff_factor * (2 ** attempt)
         backoff = min(backoff, self.max_backoff)
 
@@ -100,7 +109,7 @@ class RetryConfig:
 
 
 class RetryHandler:
-    """Handler for executing requests with retry logic."""
+    """Handler for executing requests with retry logic using Tenacity."""
 
     def __init__(self, config: RetryConfig):
         """
@@ -110,6 +119,26 @@ class RetryHandler:
             config: Retry configuration
         """
         self.config = config
+
+    def _should_retry_response(self, response: httpx.Response) -> bool:
+        """Check if a response should trigger a retry."""
+        return response.status_code in self.config.retry_status_codes
+
+    def _log_retry_attempt(self, retry_state: RetryCallState):
+        """Log retry attempts."""
+        if retry_state.outcome and retry_state.outcome.failed:
+            exception = retry_state.outcome.exception()
+            logger.warning(
+                f"Request failed with {type(exception).__name__}: {exception}, "
+                f"retrying (attempt {retry_state.attempt_number}/{self.config.max_retries + 1})..."
+            )
+        elif retry_state.outcome:
+            result = retry_state.outcome.result()
+            if isinstance(result, httpx.Response):
+                logger.warning(
+                    f"Request failed with status {result.status_code}, "
+                    f"retrying (attempt {retry_state.attempt_number}/{self.config.max_retries + 1})..."
+                )
 
     def execute(
         self,
@@ -127,68 +156,24 @@ class RetryHandler:
         Raises:
             Exception: The last exception if all retries are exhausted
         """
-        last_exception = None
-        response = None
+        # Create a retry decorator with Tenacity
+        retry_decorator = retry(
+            retry=(
+                retry_if_exception_type((httpx.ConnectError, httpx.ReadTimeout))
+                | retry_if_result(self._should_retry_response)
+            ),
+            stop=stop_after_attempt(self.config.max_retries + 1),
+            wait=wait_exponential(
+                multiplier=self.config.backoff_factor,
+                max=self.config.max_backoff,
+            ),
+            before_sleep=self._log_retry_attempt,
+            reraise=True,
+        )
 
-        for attempt in range(self.config.max_retries + 1):
-            try:
-                response = func()
-
-                # Check if we should retry based on status code
-                if not self.config.should_retry(attempt, response=response):
-                    return response
-
-                # Extract Retry-After header if present
-                retry_after = None
-                if response.status_code == 429:
-                    retry_after_header = response.headers.get("Retry-After")
-                    if retry_after_header:
-                        try:
-                            retry_after = int(retry_after_header)
-                        except ValueError:
-                            pass
-
-                # Log retry attempt
-                logger.warning(
-                    f"Request failed with status {response.status_code}, "
-                    f"retrying (attempt {attempt + 1}/{self.config.max_retries})..."
-                )
-
-                # Calculate and apply backoff
-                if attempt < self.config.max_retries:
-                    backoff_time = self.config.get_backoff_time(attempt, retry_after)
-                    logger.debug(f"Backing off for {backoff_time:.2f} seconds")
-                    time.sleep(backoff_time)
-
-            except Exception as e:
-                last_exception = e
-
-                # Check if we should retry based on exception
-                if not self.config.should_retry(attempt, exception=e):
-                    raise
-
-                # Log retry attempt
-                logger.warning(
-                    f"Request failed with {type(e).__name__}: {e}, "
-                    f"retrying (attempt {attempt + 1}/{self.config.max_retries})..."
-                )
-
-                # Calculate and apply backoff
-                if attempt < self.config.max_retries:
-                    backoff_time = self.config.get_backoff_time(attempt)
-                    logger.debug(f"Backing off for {backoff_time:.2f} seconds")
-                    time.sleep(backoff_time)
-
-        # If we exhausted all retries with a response, return it
-        if response is not None:
-            return response
-
-        # Otherwise, raise the last exception
-        if last_exception is not None:
-            raise last_exception
-
-        # This should never happen, but just in case
-        raise RuntimeError("Retry logic failed unexpectedly")
+        # Apply decorator and execute
+        retrying_func = retry_decorator(func)
+        return retrying_func()
 
     async def execute_async(
         self,
@@ -206,65 +191,21 @@ class RetryHandler:
         Raises:
             Exception: The last exception if all retries are exhausted
         """
-        last_exception = None
-        response = None
+        # Create a retry decorator with Tenacity for async
+        retry_decorator = retry(
+            retry=(
+                retry_if_exception_type((httpx.ConnectError, httpx.ReadTimeout))
+                | retry_if_result(self._should_retry_response)
+            ),
+            stop=stop_after_attempt(self.config.max_retries + 1),
+            wait=wait_exponential(
+                multiplier=self.config.backoff_factor,
+                max=self.config.max_backoff,
+            ),
+            before_sleep=self._log_retry_attempt,
+            reraise=True,
+        )
 
-        for attempt in range(self.config.max_retries + 1):
-            try:
-                response = await func()
-
-                # Check if we should retry based on status code
-                if not self.config.should_retry(attempt, response=response):
-                    return response
-
-                # Extract Retry-After header if present
-                retry_after = None
-                if response.status_code == 429:
-                    retry_after_header = response.headers.get("Retry-After")
-                    if retry_after_header:
-                        try:
-                            retry_after = int(retry_after_header)
-                        except ValueError:
-                            pass
-
-                # Log retry attempt
-                logger.warning(
-                    f"Request failed with status {response.status_code}, "
-                    f"retrying (attempt {attempt + 1}/{self.config.max_retries})..."
-                )
-
-                # Calculate and apply backoff
-                if attempt < self.config.max_retries:
-                    backoff_time = self.config.get_backoff_time(attempt, retry_after)
-                    logger.debug(f"Backing off for {backoff_time:.2f} seconds")
-                    await asyncio.sleep(backoff_time)
-
-            except Exception as e:
-                last_exception = e
-
-                # Check if we should retry based on exception
-                if not self.config.should_retry(attempt, exception=e):
-                    raise
-
-                # Log retry attempt
-                logger.warning(
-                    f"Request failed with {type(e).__name__}: {e}, "
-                    f"retrying (attempt {attempt + 1}/{self.config.max_retries})..."
-                )
-
-                # Calculate and apply backoff
-                if attempt < self.config.max_retries:
-                    backoff_time = self.config.get_backoff_time(attempt)
-                    logger.debug(f"Backing off for {backoff_time:.2f} seconds")
-                    await asyncio.sleep(backoff_time)
-
-        # If we exhausted all retries with a response, return it
-        if response is not None:
-            return response
-
-        # Otherwise, raise the last exception
-        if last_exception is not None:
-            raise last_exception
-
-        # This should never happen, but just in case
-        raise RuntimeError("Retry logic failed unexpectedly")
+        # Apply decorator and execute
+        retrying_func = retry_decorator(func)
+        return await retrying_func()

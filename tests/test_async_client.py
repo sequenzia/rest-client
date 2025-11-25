@@ -2,7 +2,7 @@
 
 import pytest
 import httpx
-from unittest.mock import Mock, AsyncMock, patch
+import respx
 
 from rest_client import AsyncClient, HTTPError, AuthenticationError
 
@@ -31,47 +31,41 @@ class TestAsyncClient:
             assert client._client is None  # Not created until first use
 
     @pytest.mark.asyncio
-    @patch('httpx.AsyncClient.send')
-    async def test_async_get_request(self, mock_send):
+    @respx.mock
+    async def test_async_get_request(self):
         """Test async GET request."""
-        mock_response = Mock(spec=httpx.Response)
-        mock_response.status_code = 200
-        mock_response.is_success = True
-        mock_response.json.return_value = {"id": 123, "name": "Test"}
-        mock_send.return_value = mock_response
+        route = respx.get("https://api.example.com/users/123").mock(
+            return_value=httpx.Response(200, json={"id": 123, "name": "Test"})
+        )
 
         client = AsyncClient(base_url="https://api.example.com")
         response = await client.get("/users/123")
 
         assert response.status_code == 200
         assert response.json() == {"id": 123, "name": "Test"}
-        mock_send.assert_called_once()
+        assert route.called
 
     @pytest.mark.asyncio
-    @patch('httpx.AsyncClient.send')
-    async def test_async_post_request(self, mock_send):
+    @respx.mock
+    async def test_async_post_request(self):
         """Test async POST request."""
-        mock_response = Mock(spec=httpx.Response)
-        mock_response.status_code = 201
-        mock_response.is_success = True
-        mock_response.json.return_value = {"id": 456, "name": "New User"}
-        mock_send.return_value = mock_response
+        route = respx.post("https://api.example.com/users").mock(
+            return_value=httpx.Response(201, json={"id": 456, "name": "New User"})
+        )
 
         client = AsyncClient(base_url="https://api.example.com")
         response = await client.post("/users", json={"name": "New User"})
 
         assert response.status_code == 201
-        mock_send.assert_called_once()
+        assert route.called
 
     @pytest.mark.asyncio
-    @patch('httpx.AsyncClient.send')
-    async def test_async_http_error(self, mock_send):
+    @respx.mock
+    async def test_async_http_error(self):
         """Test that HTTP errors raise exceptions in async client."""
-        mock_response = Mock(spec=httpx.Response)
-        mock_response.status_code = 404
-        mock_response.is_success = False
-        mock_response.reason_phrase = "Not Found"
-        mock_send.return_value = mock_response
+        respx.get("https://api.example.com/users/999").mock(
+            return_value=httpx.Response(404, text="Not Found")
+        )
 
         client = AsyncClient(base_url="https://api.example.com")
 
@@ -91,17 +85,16 @@ class TestAsyncClient:
         assert hasattr(client, 'options')
 
     @pytest.mark.asyncio
-    @patch('httpx.AsyncClient.send')
-    async def test_async_close(self, mock_send):
+    @respx.mock
+    async def test_async_close(self):
         """Test that async client properly closes."""
+        route = respx.get("https://api.example.com/test").mock(
+            return_value=httpx.Response(200)
+        )
+
         client = AsyncClient(base_url="https://api.example.com")
 
         # Force client creation
-        mock_response = Mock(spec=httpx.Response)
-        mock_response.status_code = 200
-        mock_response.is_success = True
-        mock_send.return_value = mock_response
-
         await client.get("/test")
         assert client._client is not None
 

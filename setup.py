@@ -47,6 +47,7 @@ setup(
     install_requires=[
         "httpx>=0.24.0",
         "certifi>=2023.0.0",
+        "tenacity>=8.0.0",
     ],
     extras_require={
         "dev": [

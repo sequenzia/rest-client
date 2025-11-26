@@ -2,7 +2,7 @@
 
 import pytest
 import httpx
-from unittest.mock import Mock, patch, MagicMock
+import respx
 
 from rest_client import Client, HTTPError, AuthenticationError, RateLimitError
 from rest_client.retry import RetryConfig
@@ -52,45 +52,39 @@ class TestClient:
         with Client(base_url="https://api.example.com") as client:
             assert client._client is None  # Not created until first use
 
-    @patch('httpx.Client.send')
-    def test_get_request(self, mock_send):
+    @respx.mock
+    def test_get_request(self):
         """Test GET request."""
-        mock_response = Mock(spec=httpx.Response)
-        mock_response.status_code = 200
-        mock_response.is_success = True
-        mock_response.json.return_value = {"id": 123, "name": "Test"}
-        mock_send.return_value = mock_response
+        route = respx.get("https://api.example.com/users/123").mock(
+            return_value=httpx.Response(200, json={"id": 123, "name": "Test"})
+        )
 
         client = Client(base_url="https://api.example.com")
         response = client.get("/users/123")
 
         assert response.status_code == 200
         assert response.json() == {"id": 123, "name": "Test"}
-        mock_send.assert_called_once()
+        assert route.called
 
-    @patch('httpx.Client.send')
-    def test_post_request(self, mock_send):
+    @respx.mock
+    def test_post_request(self):
         """Test POST request."""
-        mock_response = Mock(spec=httpx.Response)
-        mock_response.status_code = 201
-        mock_response.is_success = True
-        mock_response.json.return_value = {"id": 456, "name": "New User"}
-        mock_send.return_value = mock_response
+        route = respx.post("https://api.example.com/users").mock(
+            return_value=httpx.Response(201, json={"id": 456, "name": "New User"})
+        )
 
         client = Client(base_url="https://api.example.com")
         response = client.post("/users", json={"name": "New User"})
 
         assert response.status_code == 201
-        mock_send.assert_called_once()
+        assert route.called
 
-    @patch('httpx.Client.send')
-    def test_http_error_raises_exception(self, mock_send):
+    @respx.mock
+    def test_http_error_raises_exception(self):
         """Test that HTTP errors raise appropriate exceptions."""
-        mock_response = Mock(spec=httpx.Response)
-        mock_response.status_code = 404
-        mock_response.is_success = False
-        mock_response.reason_phrase = "Not Found"
-        mock_send.return_value = mock_response
+        respx.get("https://api.example.com/users/999").mock(
+            return_value=httpx.Response(404, text="Not Found")
+        )
 
         client = Client(base_url="https://api.example.com")
 
@@ -99,31 +93,28 @@ class TestClient:
 
         assert exc_info.value.status_code == 404
 
-    @patch('httpx.Client.send')
-    def test_authentication_error(self, mock_send):
+    @respx.mock
+    def test_authentication_error(self):
         """Test that 401 raises AuthenticationError."""
-        mock_response = Mock(spec=httpx.Response)
-        mock_response.status_code = 401
-        mock_response.is_success = False
-        mock_response.reason_phrase = "Unauthorized"
-        mock_response.json.side_effect = Exception()  # Simulate no JSON body
-        mock_send.return_value = mock_response
+        respx.get("https://api.example.com/protected").mock(
+            return_value=httpx.Response(401, text="Unauthorized")
+        )
 
         client = Client(base_url="https://api.example.com")
 
         with pytest.raises(AuthenticationError):
             client.get("/protected")
 
-    @patch('httpx.Client.send')
-    def test_rate_limit_error(self, mock_send):
+    @respx.mock
+    def test_rate_limit_error(self):
         """Test that 429 raises RateLimitError."""
-        mock_response = Mock(spec=httpx.Response)
-        mock_response.status_code = 429
-        mock_response.is_success = False
-        mock_response.reason_phrase = "Too Many Requests"
-        mock_response.headers = {"Retry-After": "60"}
-        mock_response.json.side_effect = Exception()  # Simulate no JSON body
-        mock_send.return_value = mock_response
+        respx.get("https://api.example.com/api/endpoint").mock(
+            return_value=httpx.Response(
+                429,
+                headers={"Retry-After": "60"},
+                text="Too Many Requests"
+            )
+        )
 
         client = Client(base_url="https://api.example.com")
 
@@ -132,13 +123,12 @@ class TestClient:
 
         assert exc_info.value.retry_after == 60
 
-    @patch('httpx.Client.send')
-    def test_raise_for_status_disabled(self, mock_send):
+    @respx.mock
+    def test_raise_for_status_disabled(self):
         """Test that errors don't raise when raise_for_status_enabled=False."""
-        mock_response = Mock(spec=httpx.Response)
-        mock_response.status_code = 404
-        mock_response.is_success = False
-        mock_send.return_value = mock_response
+        respx.get("https://api.example.com/users/999").mock(
+            return_value=httpx.Response(404, text="Not Found")
+        )
 
         client = Client(
             base_url="https://api.example.com",
@@ -159,13 +149,12 @@ class TestClient:
         assert hasattr(client, 'head')
         assert hasattr(client, 'options')
 
-    @patch('httpx.Client.send')
-    def test_custom_headers(self, mock_send):
+    @respx.mock
+    def test_custom_headers(self):
         """Test that custom headers are included in requests."""
-        mock_response = Mock(spec=httpx.Response)
-        mock_response.status_code = 200
-        mock_response.is_success = True
-        mock_send.return_value = mock_response
+        route = respx.get("https://api.example.com/test").mock(
+            return_value=httpx.Response(200)
+        )
 
         client = Client(
             base_url="https://api.example.com",
@@ -174,43 +163,38 @@ class TestClient:
         client.get("/test")
 
         # Verify the request was called with headers
-        called_request = mock_send.call_args[0][0]
-        assert "X-Custom" in called_request.headers
+        assert route.called
+        request = route.calls.last.request
+        assert "X-Custom" in request.headers
+        assert request.headers["X-Custom"] == "value"
 
-    @patch('httpx.Client.send')
-    def test_query_parameters(self, mock_send):
+    @respx.mock
+    def test_query_parameters(self):
         """Test that query parameters are properly encoded."""
-        mock_response = Mock(spec=httpx.Response)
-        mock_response.status_code = 200
-        mock_response.is_success = True
-        mock_send.return_value = mock_response
+        route = respx.get("https://api.example.com/search").mock(
+            return_value=httpx.Response(200)
+        )
 
         client = Client(base_url="https://api.example.com")
         client.get("/search", params={"q": "test query", "limit": 10})
 
         # Verify the request was called with params
-        called_request = mock_send.call_args[0][0]
-        assert "q=test+query" in str(called_request.url) or "q=test%20query" in str(called_request.url)
+        assert route.called
+        request = route.calls.last.request
+        assert "q=test+query" in str(request.url) or "q=test%20query" in str(request.url)
+        assert "limit=10" in str(request.url)
 
-    @patch('httpx.Client.send')
-    def test_retry_on_500_error(self, mock_send):
+    @respx.mock
+    def test_retry_on_500_error(self):
         """Test that 500 errors trigger retry logic."""
         # First two calls fail, third succeeds
-        mock_response_fail = Mock(spec=httpx.Response)
-        mock_response_fail.status_code = 500
-        mock_response_fail.is_success = False
-        mock_response_fail.reason_phrase = "Internal Server Error"
-        mock_response_fail.json.side_effect = Exception()
-
-        mock_response_success = Mock(spec=httpx.Response)
-        mock_response_success.status_code = 200
-        mock_response_success.is_success = True
-
-        mock_send.side_effect = [
-            mock_response_fail,
-            mock_response_fail,
-            mock_response_success
-        ]
+        route = respx.get("https://api.example.com/flaky-endpoint").mock(
+            side_effect=[
+                httpx.Response(500, text="Internal Server Error"),
+                httpx.Response(500, text="Internal Server Error"),
+                httpx.Response(200),
+            ]
+        )
 
         retry_config = RetryConfig(max_retries=3, backoff_factor=0.01)
         client = Client(
@@ -220,4 +204,4 @@ class TestClient:
         response = client.get("/flaky-endpoint")
 
         assert response.status_code == 200
-        assert mock_send.call_count == 3  # 1 initial + 2 retries
+        assert route.call_count == 3  # 1 initial + 2 retries
